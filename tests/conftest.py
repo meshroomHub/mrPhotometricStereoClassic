@@ -20,7 +20,7 @@ from photometricStereoHalide.photometricStereo import photometricStereo, Photome
 
 @pytest.fixture(scope="session")
 def dataset(tmp_path_factory):
-    """ Synthetic dataset: 2 poses of 8 images (160x120) and an ambient image each, with a mask for pose A only. """
+    """ Synthetic dataset: 2 poses of 8 images (320x240) and an ambient image each, with a mask for pose A only. """
     if not shutil.which("aliceVision_cameraInit"):
         pytest.skip("aliceVision_cameraInit is not available.")
     return createSyntheticDataset(tmp_path_factory.mktemp("dataset"))
@@ -65,3 +65,4 @@ def angularError(normals, groundTruth):
     """ Per-pixel angle, in degrees, between two (H, W, 3) normal maps. """
     cosine = np.clip(np.sum(normals.astype(np.float64) * groundTruth, axis=2), -1, 1)
     return np.degrees(np.arccos(cosine))
+

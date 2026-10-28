@@ -51,11 +51,12 @@ rez env python-3.11 pyhalide pyoiio aliceVision-develop pytest -- python -m pyte
 - `test_halidePipelines.py`: each Halide pipeline against a numpy reference on random data (odd widths to cover
   the vectorization tails of the in-place updates).
 - `test_dataIO.py`: light file formats (JSON per view or as a model, SH, `.lp`, folder) and grouping of the views by pose.
-- `test_photometricStereo.py`: end-to-end on a synthetic dataset (2 poses × 8 lights + ambient, generated with
-  `aliceVision_cameraInit`): accuracy against the ground truth normals, outputs, masks, world normals, robustness to
-  shadows, errors, and parity with `aliceVision_photometricStereo` (skipped if the binaries are not available).
+- `test_photometricStereo.py`: end-to-end on the synthetic dataset: accuracy against the ground truth normals,
+  outputs, masks, world normals, robustness to shadows, errors, and parity with `aliceVision_photometricStereo`.
 - `test_meshroomNode.py`: node descriptor and template consistency, skipped without Meshroom. To run it too:
   `rez env meshroom-develop pyhalide pyoiio pytest -- python -m pytest tests`.
+
+The tests comparing with AliceVision are skipped if the binaries are not available.
 
 ### Synthetic dataset
 
@@ -63,12 +64,14 @@ The dataset used by the tests can be created on disk to try the node manually (i
 folder, or use `cameraInit.sfm` and `lights.json` directly as inputs of the node):
 
 ```
-rez env python-3.11 pyoiio aliceVision-develop -- python tests/makeSyntheticDataset.py <outputFolder> [--width 160] [--height 120] [--lights 8] [--noise 0.002] [--seed 0]
+rez env python-3.11 pyoiio aliceVision-develop -- python tests/makeSyntheticDataset.py <outputFolder> [--width 320] [--height 240] [--lights 8] [--noise 0.002] [--seed 0]
 ```
 
-It contains 2 poses (`images/ps_A`, `images/ps_B`) of `--lights` EXR images plus an ambient image, a mask for pose A
-(`masks/A.png`), the ground truth normals and albedo (`groundTruth/`), `cameraInit.sfm`, `cameraPoses.sfm` (with an
-arbitrary rotation per pose, to test the world normals) and `lights.json`.
+Each pose (`images/ps_A`, `images/ps_B`) is a Lambertian tilted plane with Gaussian bumps and a glossy white
+calibration sphere, rendered as `--lights` EXR images plus an ambient image. The dataset also contains a mask for pose A
+(`masks/A.png`), the ground truth normals, albedo and spheres (`groundTruth/`, the spheres as a shape file usable as
+`sphereFile`), `cameraInit.sfm`, `cameraPoses.sfm` (with an arbitrary rotation per pose, to test the world normals)
+and the ground truth `lights.json`.
 
 ## Differences with the AliceVision C++ node
 

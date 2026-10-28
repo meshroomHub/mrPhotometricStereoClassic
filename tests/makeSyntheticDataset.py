@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 """
-Create a synthetic photometric stereo dataset with known normals, albedo and lights.
+Create a synthetic photometric stereo dataset with known normals, albedo, lights and calibration spheres.
 
-Each pose is a Lambertian sphere in front of a tilted plane, with a checkerboard albedo, rendered under
-directional lights with per-channel intensities, plus an ambient term and a small noise.
+Each pose is a scene with a Lambertian tilted plane with Gaussian bumps (the object) and a checkerboard albedo, and a
+glossy white calibration sphere (Lambertian plus a sharp specular highlight, as expected by the "brightestPoint"
+lighting calibration). It is rendered under directional lights with per-channel intensities, plus an ambient term and
+a small noise. The calibration sphere is realistic enough to be found by the sphere detection network.
 
 Output layout:
     <output>/
@@ -12,9 +14,10 @@ Output layout:
     ├── masks/A.png                  # Mask of pose A only (pose B uses all the pixels)
     ├── groundTruth/A_normals.exr    # Ground truth normals (camera coordinates) and albedo per pose
     ├── groundTruth/A_albedo.exr
+    ├── groundTruth/spheres.json     # Calibration spheres of every view, as a shape file (usable as sphere file)
     ├── cameraInit.sfm               # SfMData from aliceVision_cameraInit (one pose per "ps_" folder)
     ├── cameraPoses.sfm              # Same SfMData with an arbitrary rotation per pose
-    └── lights.json                  # Lights per view, in the LightingCalibration format
+    └── lights.json                  # Ground truth lights per view, in the LightingCalibration format
 
 Usage (aliceVision_cameraInit must be available):
     rez env python-3.11 pyoiio aliceVision-develop -- python tests/makeSyntheticDataset.py <outputFolder> [options]
@@ -31,10 +34,19 @@ from types import SimpleNamespace
 import numpy as np
 import OpenImageIO as oiio
 
-# Sphere per pose: center x and radius relative to the width and height, center y relative to the height
-SPHERES = {"A": (0.46875, 0.5, 1 / 3), "B": (0.5625, 0.55 / 1.2, 0.35 / 1.2)}
+# Calibration sphere per pose: center relative to the width and height, radius relative to the height
+SPHERES = {"A": (0.8, 0.3, 0.17), "B": (0.18, 0.72, 0.15)}
+# Gaussian bumps of the object per pose: center relative to the width and height, standard deviation and
+# height relative to the height
+BUMPS = {"A": [(0.35, 0.55, 0.12, 0.25), (0.5, 0.4, 0.08, 0.15)], "B": [(0.6, 0.45, 0.15, 0.3)]}
 # Mask of pose A: ellipse (center x, center y, semi-axis x, semi-axis y) relative to the image size
-MASK_ELLIPSE = (0.46875, 0.5, 0.375, 0.5 / 1.2)
+MASK_ELLIPSE = (0.42, 0.5, 0.3, 0.38)
+# Height gradient of the background plane
+PLANE_GRADIENT = (-0.2, 0.1)
+SPHERE_ALBEDO = 0.8
+# Blinn-Phong specular highlight of the calibration sphere
+SPHERE_SPECULAR = 0.6
+SPHERE_SHININESS = 200
 
 
 def makeLights(nbLights):
@@ -47,20 +59,40 @@ def makeLights(nbLights):
     return np.array(directions, np.float32), np.array(intensities, np.float32)
 
 
-def makeScene(width, height, cx, cy, radius, seed):
-    """ Return the ground truth (H, W, 3) normals and albedo of a sphere in front of a tilted plane. """
+def makeScene(width, height, sphere, bumps, seed):
+    """
+    Return the ground truth (H, W, 3) normals and albedo of a tilted plane with Gaussian bumps and a calibration sphere,
+    the (H, W, 1) mask of the sphere and the (H, W, 3) viewing directions (orthographic camera).
+    The normals of a surface of height h (towards the camera) are proportional to (-dh/dx, -dh/dy, -1).
+    """
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
-    nx, ny = (xx - cx) / radius, (yy - cy) / radius
-    d2 = nx ** 2 + ny ** 2
-    inside = d2 < 1
-    normals = np.stack([np.where(inside, nx, 0.2), np.where(inside, ny, -0.1),
-                        np.where(inside, -np.sqrt(np.clip(1 - d2, 0, 1)), -1.0)], axis=2).astype(np.float32)
-    normals /= np.linalg.norm(normals, axis=2, keepdims=True)
+    gradientX = np.full((height, width), PLANE_GRADIENT[0], np.float32)
+    gradientY = np.full((height, width), PLANE_GRADIENT[1], np.float32)
+    for bx, by, sigma, amplitude in bumps:
+        bx, by, sigma, amplitude = bx * width, by * height, sigma * height, amplitude * height
+        bump = amplitude * np.exp(-((xx - bx) ** 2 + (yy - by) ** 2) / (2 * sigma * sigma))
+        gradientX -= (xx - bx) / (sigma * sigma) * bump
+        gradientY -= (yy - by) / (sigma * sigma) * bump
+    normals = np.stack([-gradientX, -gradientY, -np.ones_like(gradientX)], axis=2)
+
     squareSize = max(2, width // 16)
     checker = ((xx // squareSize + yy // squareSize) % 2)[..., None] > 0
     albedo = np.where(checker, [0.7, 0.5, 0.3], [0.3, 0.6, 0.8]).astype(np.float32)
     albedo *= 0.8 + 0.2 * np.random.default_rng(seed).random((height, width, 1)).astype(np.float32)
-    return normals, albedo
+
+    # Calibration sphere, in front of the plane
+    views = np.zeros((height, width, 3), np.float32)
+    views[..., 2] = -1
+    cx, cy, radius = sphere
+    nx, ny = (xx - cx) / radius, (yy - cy) / radius
+    d2 = nx ** 2 + ny ** 2
+    inside = (d2 < 1)[..., None]
+    sphereNormals = np.stack([nx, ny, -np.sqrt(np.clip(1 - d2, 0, 1))], axis=2)
+    normals = np.where(inside, sphereNormals, normals)
+    albedo = np.where(inside, np.float32(SPHERE_ALBEDO), albedo)
+
+    normals /= np.linalg.norm(normals, axis=2, keepdims=True)
+    return normals.astype(np.float32), albedo.astype(np.float32), inside, views.astype(np.float32)
 
 
 def writeExr(path, pixels):
@@ -73,13 +105,13 @@ def runCommand(cmd):
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stdout}")
 
 
-def createSyntheticDataset(root, width=160, height=120, nbLights=8, noise=0.002, seed=0):
+def createSyntheticDataset(root, width=320, height=240, nbLights=8, noise=0.002, seed=0):
     """
     Create the dataset in "root" (see the module documentation for the layout).
 
     Returns:
-        SimpleNamespace with the paths, the ground truth normals per pose name ("A", "B"), the pose ids
-        per pose name, and the light directions and intensities.
+        SimpleNamespace with the paths, the ground truth normals and calibration spheres (cx, cy, radius in pixels)
+        per pose name ("A", "B"), the pose ids per pose name, and the light directions and intensities.
     """
     if not shutil.which("aliceVision_cameraInit"):
         raise RuntimeError("aliceVision_cameraInit is not available.")
@@ -87,17 +119,23 @@ def createSyntheticDataset(root, width=160, height=120, nbLights=8, noise=0.002,
     root = Path(root).absolute()
     rng = np.random.default_rng(seed)
     directions, intensities = makeLights(nbLights)
-    groundTruth = {}
+    groundTruth, spheres = {}, {}
     (root / "groundTruth").mkdir(parents=True, exist_ok=True)
 
     for name, (cx, cy, radius) in SPHERES.items():
         folder = root / "images" / f"ps_{name}"
         folder.mkdir(parents=True, exist_ok=True)
-        normals, albedo = makeScene(width, height, cx * width, cy * height, radius * height, ord(name))
+        spheres[name] = (cx * width, cy * height, radius * height)
+        normals, albedo, sphereMask, views = makeScene(width, height, spheres[name], BUMPS[name], ord(name))
         ambient = 0.04 * albedo
         for i in range(nbLights):
             shading = np.clip(normals @ directions[i], 0, None)[..., None]
-            image = albedo * shading * intensities[i] + ambient + rng.normal(0, noise, albedo.shape)
+            # Specular highlight on the sphere (Blinn-Phong, with the viewing direction of each pixel)
+            halfVectors = directions[i] + views
+            halfVectors /= np.linalg.norm(halfVectors, axis=2, keepdims=True)
+            cosines = np.clip(np.sum(normals * halfVectors, axis=2, keepdims=True), 0, None)
+            specular = SPHERE_SPECULAR * cosines ** SPHERE_SHININESS * sphereMask
+            image = (albedo * shading + specular) * intensities[i] + ambient + rng.normal(0, noise, albedo.shape)
             writeExr(folder / f"img_{i:02d}.exr", image)
         writeExr(folder / "img_ambient.exr", ambient)
         writeExr(root / "groundTruth" / f"{name}_normals.exr", normals)
@@ -116,11 +154,14 @@ def createSyntheticDataset(root, width=160, height=120, nbLights=8, noise=0.002,
     with open(sfmPath) as f:
         sfm = json.load(f)
 
-    # Lights per view, in the LightingCalibration format
-    lights, poseIds = [], {}
+    # Lights per view, in the LightingCalibration format, and calibration spheres per view, as a shape file
+    lights, poseIds, sphereObservations = [], {}, {}
     for view in sfm["views"]:
         stem = os.path.splitext(os.path.basename(view["path"]))[0]
-        poseIds[os.path.basename(os.path.dirname(view["path"]))[3:]] = int(view["poseId"])
+        name = os.path.basename(os.path.dirname(view["path"]))[3:]
+        poseIds[name] = int(view["poseId"])
+        cx, cy, radius = spheres[name]
+        sphereObservations[view["viewId"]] = {"center": {"x": cx, "y": cy}, "radius": radius}
         if "ambient" in stem:
             continue
         i = int(stem.split("_")[1])
@@ -130,6 +171,10 @@ def createSyntheticDataset(root, width=160, height=120, nbLights=8, noise=0.002,
     lightsPath = root / "lights.json"
     with open(lightsPath, "w") as f:
         json.dump({"lights": lights}, f, indent=4)
+    spheresPath = root / "groundTruth" / "spheres.json"
+    with open(spheresPath, "w") as f:
+        json.dump({"shapes": [{"name": "Calibration Spheres", "type": "Circle", "properties": {"color": "green"},
+                               "observations": sphereObservations}]}, f, indent=4)
 
     # Same SfMData with an arbitrary rotation per pose
     sfm["poses"] = []
@@ -143,15 +188,16 @@ def createSyntheticDataset(root, width=160, height=120, nbLights=8, noise=0.002,
         json.dump(sfm, f, indent=4)
 
     return SimpleNamespace(root=root, width=width, height=height, sfmPath=str(sfmPath), posedSfmPath=str(posedSfmPath),
-                           lightsPath=str(lightsPath), maskFolder=str(root / "masks"), groundTruth=groundTruth,
-                           poseIds=poseIds, directions=directions, intensities=intensities)
+                           lightsPath=str(lightsPath), spheresPath=str(spheresPath), maskFolder=str(root / "masks"),
+                           groundTruth=groundTruth, spheres=spheres, poseIds=poseIds,
+                           directions=directions, intensities=intensities)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("output", help="Output folder (created if needed).")
-    parser.add_argument("--width", type=int, default=160, help="Image width.")
-    parser.add_argument("--height", type=int, default=120, help="Image height.")
+    parser.add_argument("--width", type=int, default=320, help="Image width.")
+    parser.add_argument("--height", type=int, default=240, help="Image height.")
     parser.add_argument("--lights", type=int, default=8, help="Number of lights (images) per pose.")
     parser.add_argument("--noise", type=float, default=0.002, help="Standard deviation of the Gaussian noise.")
     parser.add_argument("--seed", type=int, default=0, help="Seed of the noise.")
@@ -170,7 +216,7 @@ def main():
     print(f"  SfMData+poses:  {dataset.posedSfmPath}")
     print(f"  Lights:         {dataset.lightsPath}")
     print(f"  Masks:          {dataset.maskFolder}")
-    print(f"  Ground truth:   {dataset.root / 'groundTruth'}")
+    print(f"  Ground truth:   {dataset.root / 'groundTruth'} (normals, albedo, spheres.json)")
 
 
 if __name__ == "__main__":
