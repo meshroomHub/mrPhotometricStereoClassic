@@ -17,6 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from makeSyntheticDataset import createSyntheticDataset, runCommand  # noqa: E402
 from photometricStereoHalide.photometricStereo import photometricStereo, PhotometricStereoParameters  # noqa: E402
 
+MODEL = "${ALICEVISION_SPHERE_DETECTION_MODEL}"
+
 
 @pytest.fixture(scope="session")
 def dataset(tmp_path_factory):
@@ -24,6 +26,21 @@ def dataset(tmp_path_factory):
     if not shutil.which("aliceVision_cameraInit"):
         pytest.skip("aliceVision_cameraInit is not available.")
     return createSyntheticDataset(tmp_path_factory.mktemp("dataset"))
+
+
+@pytest.fixture(scope="session")
+def modelAvailable():
+    if not os.path.isfile(os.path.expandvars(MODEL)):
+        pytest.skip("The sphere detection model is not available (ALICEVISION_SPHERE_DETECTION_MODEL).")
+
+
+@pytest.fixture(scope="session")
+def autoDetection(dataset, modelAvailable, tmp_path_factory):
+    """ Automatic sphere detection on the whole dataset, run once (about 1s per image on CPU). """
+    from photometricStereoHalide import sphereDetection
+    outputPath = str(tmp_path_factory.mktemp("autoDetection") / "detection.json")
+    sphereDetection.autoDetectSpheres(dataset.sfmPath, MODEL, outputPath)
+    return outputPath
 
 
 @pytest.fixture
