@@ -30,6 +30,14 @@ def dataset(tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
+def perspectiveDataset(tmp_path_factory):
+    """ Same dataset with the calibration spheres seen by a wide angle (90 degrees) pinhole camera. """
+    if not shutil.which("aliceVision_cameraInit"):
+        pytest.skip("aliceVision_cameraInit is not available.")
+    return createSyntheticDataset(tmp_path_factory.mktemp("perspectiveDataset"), perspective=True, fieldOfView=90)
+
+
+@pytest.fixture(scope="session")
 def modelAvailable():
     if not os.path.isfile(os.path.expandvars(MODEL)):
         pytest.skip("The sphere detection model is not available (ALICEVISION_SPHERE_DETECTION_MODEL).")

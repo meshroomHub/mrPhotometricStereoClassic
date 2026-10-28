@@ -13,7 +13,7 @@ import pytest
 from pyalicevision import image as avimage
 
 from conftest import angularError, lightErrors, readImage, readLights
-from makeSyntheticDataset import SPHERE_ALBEDO, runCommand
+from makeSyntheticDataset import SPHERE_ALBEDO, perspectiveSphere, runCommand
 
 from photometricStereoHalide import dataIO
 from photometricStereoHalide import lightingCalibration as lc
@@ -193,5 +193,63 @@ def test_fullChain(dataset, autoDetection, runHalide, tmp_path, monkeypatch, met
         assert np.median(error) < 15
 
 
-def test_brightestPointTinySphere(imagePath):
-    assert lc.calibrateImage(imagePath, (100.0, 100.0, 0.4), "brightestPoint") is None
+def test_pinholeCamera(dataset):
+    sfm = dataIO.loadSfmData(dataset.sfmPath)
+    camera = lc.pinholeCamera(sfm, next(iter(sfm.getViews().values())))
+    expectedFocal = dataset.width / 2 / np.tan(np.radians(45) / 2)
+    assert camera.focal == pytest.approx((expectedFocal, expectedFocal), rel=1e-6)
+    assert camera.principalPoint == (dataset.width // 2, dataset.height // 2)
+
+
+@pytest.mark.parametrize("position", [(160, 120), (60, 50), (270, 200)], ids=["center", "topLeft", "bottomRight"])
+def test_perspectiveSphereGeometry(position):
+    """ The sphere recovered from its minor axis circle matches a rendered perspective sphere. """
+    width, height, focal = 320, 240, 160.0
+    normals, views, inside, circle = perspectiveSphere(width, height, (*position, 30), focal)
+    sphere = lc.PerspectiveSphere(circle, lc.PinholeCamera((focal, focal), (width // 2, height // 2)))
+
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float64)
+    estimatedNormals, estimatedViews, estimatedInside = sphere.geometry(xx, yy)
+    # Same silhouette, up to the pixels of its border
+    assert np.sum(inside != estimatedInside) < 0.05 * np.sum(inside)
+    both = inside & estimatedInside
+    assert np.allclose(estimatedViews, views, atol=1e-9)
+    assert np.median(angularError(estimatedNormals[both][None], normals[both][None])) < 1
+    # The region contains the sphere
+    x0, y0, x1, y1 = sphere.region()
+    rows, cols = np.nonzero(inside)
+    assert x0 <= cols.min() and cols.max() < x1 and y0 <= rows.min() and rows.max() < y1
+
+
+@pytest.mark.parametrize("method", lc.METHODS)
+def test_ellipticEstimation(perspectiveDataset, tmp_path, method):
+    """ On spheres seen in perspective, the elliptic estimation recovers the lights, unlike the orthographic model. """
+    errors = {}
+    for elliptic in (False, True):
+        outputPath = tmp_path / f"lights_{elliptic}.json"
+        lc.lightingCalibration(perspectiveDataset.sfmPath, perspectiveDataset.spheresPath, str(outputPath), method,
+                               ellipticEstimation=elliptic)
+        errors[elliptic] = list(lightErrors(outputPath, perspectiveDataset.lightsPath).values())
+        assert len(errors[elliptic]) == len(readLights(perspectiveDataset.lightsPath))
+    assert np.median(errors[True]) < 2
+    assert np.max(errors[True]) < 3
+    assert np.median(errors[False]) > 10
+
+
+def test_ellipticEstimationNeedsPinhole(perspectiveDataset, tmp_path):
+    with open(perspectiveDataset.sfmPath) as f:
+        sfm = json.load(f)
+    for intrinsic in sfm["intrinsics"]:
+        intrinsic["type"] = "equidistant"
+    sfmPath = tmp_path / "equidistant.sfm"
+    sfmPath.write_text(json.dumps(sfm))
+    with pytest.raises(RuntimeError, match="pinhole"):
+        lc.lightingCalibration(str(sfmPath), perspectiveDataset.spheresPath, str(tmp_path / "lights.json"),
+                               "whiteSphere", ellipticEstimation=True)
+
+
+@pytest.mark.parametrize("elliptic", [False, True], ids=["orthographic", "elliptic"])
+def test_brightestPointTinySphere(dataset, imagePath, elliptic):
+    sfm = dataIO.loadSfmData(dataset.sfmPath)
+    camera = lc.pinholeCamera(sfm, next(iter(sfm.getViews().values()))) if elliptic else None
+    assert lc.calibrateImage(imagePath, (100.0, 100.0, 0.4), "brightestPoint", camera=camera) is None

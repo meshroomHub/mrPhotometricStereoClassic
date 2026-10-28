@@ -63,6 +63,26 @@ One light per image with a sphere (ambient images excluded), written in the same
 - **SH**: the whiteSphere fit for the directional part, then the 6 other terms of the AliceVision second order
   spherical harmonics fitted on the residual. The photometric stereo only uses the directional part.
 
+**Sphere model**:
+
+- Orthographic (default): the sphere image is the detected circle, the normals come from the pixel position relative
+  to its center, and the viewing direction is `(0, 0, -1)` everywhere.
+- Perspective (`ellipticEstimation`): the image of a sphere seen by a pinhole camera is an ellipse, whose minor axis is
+  the detected circle. For a sphere of angular radius `α` whose center direction makes an angle `θ` with the optical
+  axis, the minor semi-axis is `b = f.sin(α) / sqrt(cos²θ - sin²α)` and the ellipse center is at the distance
+  `ρ = f.sin(θ).cos(θ) / (cos²θ - sin²α)` from the principal point. Inverting: `tan(θ) = ρ.f / (b² + f²)` and
+  `sin(α) = cos(θ).b / sqrt(b² + f²)`, which gives the 3D center of a unit sphere from the circle and the pinhole
+  intrinsics of the view (focal, principal point = image center + offset). The normals and viewing directions come
+  from the camera rays intersecting the sphere, for all the methods (the mirror reflection of `brightestPoint` uses
+  the viewing direction of the brightest pixel). Only pinhole intrinsics are supported (distortion is ignored).
+
+  On the synthetic dataset seen with a 90° (resp. 45°) field of view, with the ground truth circles, the lights are
+  within 0.9 to 1.6 degrees (median) with the elliptic estimation, and 20 to 22 (resp. 12) degrees without it. It must
+  only be used on images seen in perspective: on the orthographic synthetic dataset, it gives 11 to 14 degrees of error.
+  The circles must be centered on the ellipses: the sphere detection network, which boxes the sphere image and
+  inscribes the circle in the top-left corner of the box, does not give these circles on elongated ellipses (and it
+  misses most of the spheres of the 90° synthetic dataset).
+
 The images are read as luminance (`0.2126 R + 0.7152 G + 0.0722 B`, like AliceVision's grayscale reading), and only
 the sphere area is read through OIIO, except for RAW images. The node also writes `<imageStem>_<method>.png` images of
 a sphere lit by each estimated light, like AliceVision (images with the same file name in different folders share it).
@@ -105,8 +125,9 @@ rez env python-3.11 pyhalide pyoiio pyonnxruntime aliceVision-develop pytest -- 
   (~15s on CPU).
 - `test_lightingCalibration.py`: partial image reading against AliceVision's, each method against the ground truth
   lights and intensities, `saveAsModel`, skipped views, parity of `brightestPoint` (lights and visualizations) with
-  `aliceVision_lightingCalibration`, and the full chain of Python nodes (detected spheres → lighting calibration →
-  photometric stereo) against the ground truth lights and normals.
+  `aliceVision_lightingCalibration`, the perspective sphere model (geometry against rendered spheres, every method
+  with and without `ellipticEstimation` on a 90° perspective dataset, pinhole intrinsics), and the full chain of Python
+  nodes (detected spheres → lighting calibration → photometric stereo) against the ground truth lights and normals.
 - `test_meshroomNode.py`: node descriptors, resources, keyable `sphereShape` values and template consistency,
   skipped without Meshroom. To run it too:
   `rez env meshroom-develop pyhalide pyoiio pyonnxruntime pytest -- python -m pytest tests`.
@@ -119,8 +140,12 @@ The dataset used by the tests can be created on disk to try the nodes or the who
 `images` folder, or use `cameraInit.sfm`, `lights.json` or `groundTruth/spheres.json` directly as node inputs):
 
 ```
-rez env python-3.11 pyoiio aliceVision-develop -- python tests/makeSyntheticDataset.py <outputFolder> [--width 320] [--height 240] [--lights 8] [--noise 0.002] [--seed 0]
+rez env python-3.11 pyoiio aliceVision-develop -- python tests/makeSyntheticDataset.py <outputFolder> [--width 320] [--height 240] [--lights 8] [--noise 0.002] [--seed 0] [--perspective] [--fieldOfView 45]
 ```
+
+With `--perspective`, the calibration spheres are rendered with the pinhole camera of CameraInit (horizontal field of
+view `--fieldOfView`): their images are ellipses, and `groundTruth/spheres.json` contains the circles on their minor
+axes, measured on the rendered silhouettes. The spheres are shrunk if needed to stay inside the image.
 
 Each pose (`images/ps_A`, `images/ps_B`) is a Lambertian tilted plane with Gaussian bumps and a glossy white
 calibration sphere, rendered as `--lights` EXR images plus an ambient image. The dataset also contains a mask for pose A
@@ -176,7 +201,8 @@ visualizations (at most 1 level of difference). Differences:
   direction in C++). The C++ SH directions are correct and match these ones.
 - The views sharing the same acquisition date are all calibrated (C++ keeps only one of them).
 - Views whose sphere has fewer usable pixels than unknowns are skipped with a warning.
-- `ellipticEstimation` (perspective sphere model) is not supported: the C++ implementation crashes, as the mask used
-  to fit the ellipse is never drawn.
+- `ellipticEstimation` works (see above). The C++ implementation crashes, as the mask used to fit the ellipse is never
+  drawn; its intended model (3D sphere from the ellipse and the intrinsics, normals from the camera rays) is the one
+  implemented here, with a closed form instead of an ellipse fitting. Unlike C++, it also supports the SH method.
 - Views with a sphere smaller than a pixel are skipped with a warning (C++ reads an empty patch).
 - The values are written as JSON numbers (the C++ node writes strings).

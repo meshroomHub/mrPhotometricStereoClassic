@@ -36,6 +36,14 @@ Python implementation of the AliceVision LightingCalibration node (same inputs a
             description="Check if this calibration file will be used with other datasets.",
             value=False,
         ),
+        desc.BoolParam(
+            name="ellipticEstimation",
+            label="Use elliptic estimation",
+            description="Consider the right projection of the sphere. Fit the circle tool on the small axe of the ellipse.\n"
+                        "The sphere is recovered in 3D from the pinhole camera intrinsics: the normals and viewing\n"
+                        "directions take the perspective into account.",
+            value=False,
+        ),
         desc.ChoiceParam(
             name="method",
             label="Calibration Method",
@@ -80,6 +88,6 @@ Python implementation of the AliceVision LightingCalibration node (same inputs a
             lightingCalibration(node.inputPath.value, node.inputDetection.value, node.outputFile.value,
                                 method=node.method.value, saveAsModel=node.saveAsModel.value,
                                 visualizationFolder=os.path.dirname(node.outputFile.value),
-                                logger=chunk.logger)
+                                ellipticEstimation=node.ellipticEstimation.value, logger=chunk.logger)
         finally:
             chunk.logManager.end()

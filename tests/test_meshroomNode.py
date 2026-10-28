@@ -116,7 +116,7 @@ def test_template(nodeDescs):
 def test_lightingCalibrationDescriptor(nodeDescs):
     nodeDesc = nodeDescs["LightingCalibrationPy"]
     assert issubclass(nodeDesc, desc.Node)
-    assert {a.name for a in nodeDesc.inputs} >= {"inputPath", "inputDetection", "saveAsModel", "method"}
+    assert {a.name for a in nodeDesc.inputs} >= {"inputPath", "inputDetection", "saveAsModel", "ellipticEstimation", "method"}
     assert {a.name for a in nodeDesc.outputs} == {"outputFile", "lightingEstimationVisualization"}
     method = next(a for a in nodeDesc.inputs if a.name == "method")
     assert method.values == ["brightestPoint", "whiteSphere", "SH"]

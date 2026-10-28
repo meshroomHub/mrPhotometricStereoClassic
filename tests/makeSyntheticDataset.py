@@ -21,6 +21,9 @@ Output layout:
 
 Usage (aliceVision_cameraInit must be available):
     rez env python-3.11 pyoiio aliceVision-develop -- python tests/makeSyntheticDataset.py <outputFolder> [options]
+
+With --perspective, the calibration sphere is rendered with a pinhole camera (the CameraInit one): its image is an
+ellipse, and groundTruth/spheres.json contains the circles on the minor axes of the ellipses.
 """
 
 import argparse
@@ -59,11 +62,52 @@ def makeLights(nbLights):
     return np.array(directions, np.float32), np.array(intensities, np.float32)
 
 
-def makeScene(width, height, sphere, bumps, seed):
+def perspectiveSphere(width, height, sphere, focal):
+    """
+    Render a unit sphere seen by a pinhole camera (principal point at the image center), placed so that its center
+    projects on (cx, cy) with an apparent radius of about "radius" pixels. The radius is reduced if needed so that the
+    whole sphere image is inside the image (with a margin of 2 pixels).
+
+    Returns:
+        (normals, views, inside, circle): the (H, W, 3) normals and viewing directions (towards the camera), the
+        (H, W) mask of the sphere, and the circle (cx, cy, b) on the minor axis of the sphere image, measured on the
+        rendered silhouette (centroid and second moments), as a user would draw it.
+    """
+    cx, cy, radius = sphere
+    principalPoint = (width // 2, height // 2)
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float64)
+    rays = np.stack([(xx - principalPoint[0]) / focal, (yy - principalPoint[1]) / focal, np.ones_like(xx)], axis=2)
+    rays /= np.linalg.norm(rays, axis=2, keepdims=True)
+
+    centerDirection = np.array([(cx - principalPoint[0]) / focal, (cy - principalPoint[1]) / focal, 1.0])
+    centerDirection /= np.linalg.norm(centerDirection)
+    margin = 2
+    while True:
+        center = centerDirection * np.hypot(radius, focal) / radius  # sin(angular radius) = radius / hypot(radius, focal)
+        # Ray / sphere intersection
+        projection = rays @ center
+        discriminant = projection ** 2 - (center @ center - 1)
+        inside = discriminant > 0
+        if not (inside[:margin].any() or inside[-margin:].any() or inside[:, :margin].any() or inside[:, -margin:].any()):
+            break
+        radius *= 0.95
+    normals = (projection - np.sqrt(np.clip(discriminant, 0, None)))[..., None] * rays - center
+    normals /= np.linalg.norm(normals, axis=2, keepdims=True)
+
+    # Ellipse of the silhouette: minor semi-axis b = 2 sqrt(smallest eigenvalue of the covariance)
+    points = np.stack([xx[inside], yy[inside]], axis=1)
+    centroid = points.mean(axis=0)
+    minorSemiAxis = 2 * np.sqrt(np.linalg.eigvalsh(np.cov(points.T))[0])
+    return normals, -rays, inside, (float(centroid[0]), float(centroid[1]), float(minorSemiAxis))
+
+
+def makeScene(width, height, sphere, bumps, seed, focal=None):
     """
     Return the ground truth (H, W, 3) normals and albedo of a tilted plane with Gaussian bumps and a calibration sphere,
-    the (H, W, 1) mask of the sphere and the (H, W, 3) viewing directions (orthographic camera).
+    the (H, W, 1) mask of the sphere, the (H, W, 3) viewing directions and the circle of the sphere (cx, cy, radius).
     The normals of a surface of height h (towards the camera) are proportional to (-dh/dx, -dh/dy, -1).
+    With a focal, the sphere is seen in perspective (the plane and the bumps are normal fields: they do not depend on
+    the camera model), otherwise with an orthographic camera.
     """
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
     gradientX = np.full((height, width), PLANE_GRADIENT[0], np.float32)
@@ -83,16 +127,21 @@ def makeScene(width, height, sphere, bumps, seed):
     # Calibration sphere, in front of the plane
     views = np.zeros((height, width, 3), np.float32)
     views[..., 2] = -1
-    cx, cy, radius = sphere
-    nx, ny = (xx - cx) / radius, (yy - cy) / radius
-    d2 = nx ** 2 + ny ** 2
-    inside = (d2 < 1)[..., None]
-    sphereNormals = np.stack([nx, ny, -np.sqrt(np.clip(1 - d2, 0, 1))], axis=2)
+    if focal:
+        sphereNormals, sphereViews, inside, sphere = perspectiveSphere(width, height, sphere, focal)
+        inside = inside[..., None]
+        views = np.where(inside, sphereViews, views)
+    else:
+        cx, cy, radius = sphere
+        nx, ny = (xx - cx) / radius, (yy - cy) / radius
+        d2 = nx ** 2 + ny ** 2
+        inside = (d2 < 1)[..., None]
+        sphereNormals = np.stack([nx, ny, -np.sqrt(np.clip(1 - d2, 0, 1))], axis=2)
     normals = np.where(inside, sphereNormals, normals)
     albedo = np.where(inside, np.float32(SPHERE_ALBEDO), albedo)
 
     normals /= np.linalg.norm(normals, axis=2, keepdims=True)
-    return normals.astype(np.float32), albedo.astype(np.float32), inside, views.astype(np.float32)
+    return normals.astype(np.float32), albedo.astype(np.float32), inside, views.astype(np.float32), sphere
 
 
 def writeExr(path, pixels):
@@ -105,9 +154,14 @@ def runCommand(cmd):
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stdout}")
 
 
-def createSyntheticDataset(root, width=320, height=240, nbLights=8, noise=0.002, seed=0):
+def createSyntheticDataset(root, width=320, height=240, nbLights=8, noise=0.002, seed=0, perspective=False,
+                           fieldOfView=45.0):
     """
     Create the dataset in "root" (see the module documentation for the layout).
+
+    Args:
+        perspective: render the calibration sphere with a pinhole camera of horizontal field of view "fieldOfView"
+                     (the one given to CameraInit), instead of an orthographic camera.
 
     Returns:
         SimpleNamespace with the paths, the ground truth normals and calibration spheres (cx, cy, radius in pixels)
@@ -122,11 +176,12 @@ def createSyntheticDataset(root, width=320, height=240, nbLights=8, noise=0.002,
     groundTruth, spheres = {}, {}
     (root / "groundTruth").mkdir(parents=True, exist_ok=True)
 
+    focal = (width / 2) / np.tan(np.radians(fieldOfView) / 2) if perspective else None
     for name, (cx, cy, radius) in SPHERES.items():
         folder = root / "images" / f"ps_{name}"
         folder.mkdir(parents=True, exist_ok=True)
-        spheres[name] = (cx * width, cy * height, radius * height)
-        normals, albedo, sphereMask, views = makeScene(width, height, spheres[name], BUMPS[name], ord(name))
+        normals, albedo, sphereMask, views, spheres[name] = makeScene(
+            width, height, (cx * width, cy * height, radius * height), BUMPS[name], ord(name), focal)
         ambient = 0.04 * albedo
         for i in range(nbLights):
             shading = np.clip(normals @ directions[i], 0, None)[..., None]
@@ -149,10 +204,16 @@ def createSyntheticDataset(root, width=320, height=240, nbLights=8, noise=0.002,
     oiio.ImageBuf(np.ascontiguousarray(mask[..., None])).write(str(root / "masks" / "A.png"))
 
     sfmPath = root / "cameraInit.sfm"
-    runCommand(["aliceVision_cameraInit", "--imageFolder", str(root / "images"), "--defaultFieldOfView", "45",
+    runCommand(["aliceVision_cameraInit", "--imageFolder", str(root / "images"), "--defaultFieldOfView", str(fieldOfView),
                 "--allowSingleView", "1", "--output", str(sfmPath), "--verboseLevel", "error"])
     with open(sfmPath) as f:
         sfm = json.load(f)
+    if focal:
+        # The focal in pixels of the SfMData must be the rendering one
+        intrinsic = sfm["intrinsics"][0]
+        sfmFocal = float(intrinsic["focalLength"]) / float(intrinsic["sensorWidth"]) * width
+        if abs(sfmFocal - focal) > 1e-3 * focal or any(float(v) != 0 for v in intrinsic["principalPoint"]):
+            raise RuntimeError(f"Unexpected CameraInit intrinsics: focal {sfmFocal} instead of {focal}.")
 
     # Lights per view, in the LightingCalibration format, and calibration spheres per view, as a shape file
     lights, poseIds, sphereObservations = [], {}, {}
@@ -201,6 +262,9 @@ def main():
     parser.add_argument("--lights", type=int, default=8, help="Number of lights (images) per pose.")
     parser.add_argument("--noise", type=float, default=0.002, help="Standard deviation of the Gaussian noise.")
     parser.add_argument("--seed", type=int, default=0, help="Seed of the noise.")
+    parser.add_argument("--perspective", action="store_true",
+                        help="Render the calibration sphere with a pinhole camera (elliptic sphere image).")
+    parser.add_argument("--fieldOfView", type=float, default=45.0, help="Horizontal field of view of the camera (degrees).")
     args = parser.parse_args()
 
     if args.lights < 3:
@@ -208,7 +272,8 @@ def main():
     if os.path.isdir(args.output) and os.listdir(args.output):
         parser.error(f"The output folder '{args.output}' is not empty.")
 
-    dataset = createSyntheticDataset(args.output, args.width, args.height, args.lights, args.noise, args.seed)
+    dataset = createSyntheticDataset(args.output, args.width, args.height, args.lights, args.noise, args.seed,
+                                     args.perspective, args.fieldOfView)
     print(f"Synthetic dataset created in '{dataset.root}':")
     print(f"  {len(SPHERES)} poses ({', '.join(f'ps_{n}: pose id {p}' for n, p in dataset.poseIds.items())}), "
           f"{args.lights} lights + ambient, {args.width}x{args.height}")

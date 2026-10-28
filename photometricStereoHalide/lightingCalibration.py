@@ -8,6 +8,13 @@ Methods:
       that are neither in shadow nor saturated. The intensity is |L|.
     - SH: whiteSphere for the directional part, then second order spherical harmonics fit on the residual.
 
+Sphere models:
+    - Orthographic (default): the sphere image is the detected circle, the normals are computed from the pixel position
+      relative to its center, and the viewing direction is (0, 0, -1) everywhere.
+    - Perspective ("ellipticEstimation"): the sphere image is an ellipse, whose minor axis is the detected circle. The
+      3D sphere is recovered from the camera intrinsics, and the normals and viewing directions come from the camera
+      rays intersecting it.
+
 Only the area of the sphere is read from the images when the file format allows it.
 """
 
@@ -15,10 +22,12 @@ import functools
 import json
 import logging
 import os
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import OpenImageIO as oiio
+from pyalicevision import camera as avcamera
 from pyalicevision import image as avimage
 
 from . import dataIO
@@ -29,7 +38,86 @@ LUMINANCE = (0.2126, 0.7152, 0.0722)
 # Sphere pixels used by the fitting methods: away from the silhouette, neither in shadow nor saturated
 MAX_RELATIVE_DISTANCE = 0.95
 MIN_VALUE, MAX_VALUE = 0.2, 0.8
+# Same criterion for the perspective model, as the minimum cosine between the normal and the viewing direction
+MIN_VIEW_COSINE = float(np.sqrt(1 - MAX_RELATIVE_DISTANCE ** 2))
 VISUALIZATION_SIZE = 1024
+
+
+@dataclass
+class PinholeCamera:
+    focal: Tuple[float, float]  # (fx, fy) in pixels
+    principalPoint: Tuple[float, float]  # (px, py) in pixels
+
+    def rays(self, xx: np.ndarray, yy: np.ndarray) -> np.ndarray:
+        """ Unit directions (..., 3) of the camera rays through the pixels (camera looking towards +z, y down). """
+        rays = np.stack([(xx - self.principalPoint[0]) / self.focal[0], (yy - self.principalPoint[1]) / self.focal[1],
+                         np.ones_like(xx, dtype=np.float64)], axis=-1)
+        return rays / np.linalg.norm(rays, axis=-1, keepdims=True)
+
+
+def pinholeCamera(sfm, view) -> PinholeCamera:
+    """ Camera of a view: focal and principal point (image center + offset) of its pinhole intrinsic. """
+    intrinsics = sfm.getIntrinsics()
+    intrinsicId = view.getIntrinsicId()
+    if intrinsicId not in intrinsics.keys():
+        raise RuntimeError(f"View {view.getViewId()} has no intrinsic: the elliptic estimation needs the camera focal.")
+    intrinsic = intrinsics[intrinsicId]
+    if not avcamera.isPinhole(intrinsic.getType()):
+        raise RuntimeError(f"The elliptic estimation needs a pinhole camera, not '{intrinsic.getTypeStr()}' "
+                           f"(view {view.getViewId()}).")
+    fx, fy, offsetX, offsetY = np.array(intrinsic.getParameters(), dtype=np.float64)[:4]
+    return PinholeCamera((float(fx), float(fy)), (intrinsic.w() // 2 + float(offsetX), intrinsic.h() // 2 + float(offsetY)))
+
+
+class PerspectiveSphere:
+    """
+    Unit sphere whose image is an ellipse of center (cx, cy) and minor semi-axis b (the detected circle).
+
+    For a sphere of angular radius alpha whose center direction makes an angle theta with the optical axis, the image
+    is an ellipse of minor semi-axis b = f.sin(alpha) / sqrt(cos²(theta) - sin²(alpha)), centered at the distance
+    rho = f.sin(theta).cos(theta) / (cos²(theta) - sin²(alpha)) from the principal point, along the direction of the
+    sphere center. Inverting: tan(theta) = rho.f / (b² + f²) and sin(alpha) = cos(theta).b / sqrt(b² + f²).
+    The sphere radius is 1: the scale does not change the normals.
+    """
+
+    def __init__(self, circle, camera: PinholeCamera):
+        cx, cy, b = circle
+        self.camera = camera
+        # Normalized image coordinates (focal = 1)
+        u = (cx - camera.principalPoint[0]) / camera.focal[0]
+        v = (cy - camera.principalPoint[1]) / camera.focal[1]
+        rho, beta = np.hypot(u, v), b / camera.focal[0]
+        theta = np.arctan(rho / (beta * beta + 1))
+        sinAlpha = np.cos(theta) * beta / np.sqrt(beta * beta + 1)
+        phi = np.arctan2(v, u)
+        self.center = np.array([np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)]) / sinAlpha
+        # Major semi-axis, for the region containing the sphere
+        cosAlpha = np.sqrt(1 - sinAlpha * sinAlpha)
+        self.majorSemiAxis = camera.focal[0] * sinAlpha * cosAlpha / (np.cos(theta) ** 2 - sinAlpha * sinAlpha)
+        self.circle = circle
+
+    def region(self):
+        """ Pixel bounds (x0, y0, x1, y1) of the sphere image. """
+        cx, cy, _ = self.circle
+        halfSize = self.majorSemiAxis + 2
+        return (int(np.floor(cx - halfSize)), int(np.floor(cy - halfSize)),
+                int(np.ceil(cx + halfSize)) + 1, int(np.ceil(cy + halfSize)) + 1)
+
+    def geometry(self, xx: np.ndarray, yy: np.ndarray):
+        """
+        Intersect the camera rays of the pixels with the sphere.
+
+        Returns:
+            (normals, views, inside): (..., 3) normals and viewing directions (unit vectors towards the camera), and the
+            (...) mask of the pixels whose ray hits the sphere. Outside, the normal is the one of the closest point.
+        """
+        rays = self.camera.rays(xx, yy)
+        projection = rays @ self.center
+        discriminant = projection * projection - (self.center @ self.center - 1)
+        distance = projection - np.sqrt(np.clip(discriminant, 0, None))
+        normals = distance[..., None] * rays - self.center
+        normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+        return normals, -rays, discriminant > 0
 
 
 def readLuminance(path: str, x0: int, y0: int, x1: int, y1: int):
@@ -97,17 +185,25 @@ def separableConvolution(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     return result.astype(np.float32)
 
 
-def brightestPoint(path: str, sphere):
+def mirrorReflection(normal: np.ndarray, view: np.ndarray) -> np.ndarray:
+    """ Light direction whose mirror reflection on the normal goes towards the camera (view direction). """
+    return 2 * normal.dot(view) * normal - view
+
+
+def brightestPoint(path: str, sphere, perspectiveSphere: Optional[PerspectiveSphere] = None):
     """
     Light direction from the brightest point of a shiny sphere, as in AliceVision: the sphere is cut out of the image,
     smoothed with a triangle kernel, and the light is the mirror reflection of the viewing direction on the normal of
-    the maximum, the viewing direction being (0, 0, -1) (orthographic camera).
+    the maximum. The viewing direction is (0, 0, -1) with the orthographic model, the camera ray with the perspective one.
 
     Returns:
         (direction, intensity), or None if the sphere is smaller than a pixel.
     """
     if sphere[2] < 1:
         return None
+    if perspectiveSphere is not None:
+        return _brightestPointPerspective(path, perspectiveSphere)
+
     cx, cy, radius = sphere
     x0, y0 = int(np.floor(cx - radius)), int(np.floor(cy - radius))
     # std::round: half away from zero
@@ -125,15 +221,40 @@ def brightestPoint(path: str, sphere):
 
     nx, ny = (col + x0 - cx) / radius, (row + y0 - cy) / radius
     normal = np.array([nx, ny, -np.sqrt(max(1 - nx * nx - ny * ny, 0.0))])
-    # Mirror reflection of the viewing direction (0, 0, -1) on the normal
-    return 2 * normal.dot(np.array([0.0, 0.0, -1.0])) * normal - np.array([0.0, 0.0, -1.0]), 1.0
+    return mirrorReflection(normal, np.array([0.0, 0.0, -1.0])), 1.0
 
 
-def sphereSamples(path: str, sphere):
+def _brightestPointPerspective(path: str, sphere: PerspectiveSphere):
+    x0, y0, x1, y1 = sphere.region()
+    patch, _, _ = readLuminance(path, x0, y0, x1, y1)
+    yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float64)
+    _, _, inside = sphere.geometry(xx, yy)
+    patch[~inside] = 0
+
+    kernelSize = int(np.floor(sphere.circle[2] / 20 + 0.5))
+    if kernelSize > 0:
+        patch = separableConvolution(patch, triangleKernel(kernelSize))
+    row, col = np.unravel_index(np.argmax(patch), patch.shape)
+
+    normal, view, _ = sphere.geometry(np.array(float(col + x0)), np.array(float(row + y0)))
+    direction = mirrorReflection(normal, view)
+    return direction / np.linalg.norm(direction), 1.0
+
+
+def sphereSamples(path: str, sphere, perspectiveSphere: Optional[PerspectiveSphere] = None):
     """
     Return the normals (N, 3) and values (N,) of the sphere pixels used by the fitting methods.
-    The normals are computed from the pixel position relative to the sphere center (orthographic camera).
+    With the orthographic model, the normals are computed from the pixel position relative to the sphere center.
     """
+    if perspectiveSphere is not None:
+        x0, y0, x1, y1 = perspectiveSphere.region()
+        patch, width, height = readLuminance(path, x0, y0, x1, y1)
+        yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float64)
+        normals, views, inside = perspectiveSphere.geometry(xx, yy)
+        valid = (inside & (np.sum(normals * views, axis=-1) > MIN_VIEW_COSINE) & (patch > MIN_VALUE) & (patch < MAX_VALUE)
+                 & (xx >= 0) & (xx < width) & (yy >= 0) & (yy < height))
+        return normals[valid], patch[valid].astype(np.float64)
+
     cx, cy, radius = sphere
     x0, y0 = int(np.floor(cx - radius)), int(np.floor(cy - radius))
     x1, y1 = int(np.ceil(cx + radius)) + 1, int(np.ceil(cy + radius)) + 1
@@ -161,9 +282,13 @@ def shBasis(normals):
     return np.stack([np.ones_like(nx), nx * ny, nx * nz, ny * nz, nx * nx - ny * ny, 3 * nz * nz - 1], axis=1)
 
 
-def calibrateImage(path: str, sphere, method: str, logger=logging.getLogger(__name__)):
+def calibrateImage(path: str, sphere, method: str, logger=logging.getLogger(__name__),
+                   camera: Optional[PinholeCamera] = None):
     """
     Calibrate the light of one image from its sphere (cx, cy, radius in pixels).
+
+    Args:
+        camera: if set, use the perspective sphere model (the circle is the minor axis of the sphere image).
 
     Returns:
         (direction, intensity): the 3 (directional) or 9 (SH) light coefficients and the intensity,
@@ -171,13 +296,14 @@ def calibrateImage(path: str, sphere, method: str, logger=logging.getLogger(__na
     """
     if method not in METHODS:
         raise ValueError(f"Unknown lighting calibration method: '{method}'.")
+    perspectiveSphere = PerspectiveSphere(sphere, camera) if camera is not None else None
     if method == "brightestPoint":
-        result = brightestPoint(path, sphere)
+        result = brightestPoint(path, sphere, perspectiveSphere)
         if result is None:
             logger.warning(f"The sphere of '{path}' is too small (radius {sphere[2]:.2f}): the light cannot be calibrated.")
         return result
 
-    normals, values = sphereSamples(path, sphere)
+    normals, values = sphereSamples(path, sphere, perspectiveSphere)
     minSamples = 3 if method == "whiteSphere" else 9
     if len(values) < minSamples:
         logger.warning(f"Not enough sphere pixels between {MIN_VALUE} and {MAX_VALUE} in '{path}' "
@@ -238,7 +364,7 @@ def sortedViews(sfm) -> List[tuple]:
 
 def lightingCalibration(sfmPath: str, detectionPath: str, outputPath: str, method: str = "brightestPoint",
                         saveAsModel: bool = False, visualizationFolder: Optional[str] = None,
-                        logger=logging.getLogger(__name__)):
+                        ellipticEstimation: bool = False, logger=logging.getLogger(__name__)):
     """
     Calibrate the light of every image with a sphere and write the lights JSON file.
 
@@ -247,6 +373,8 @@ def lightingCalibration(sfmPath: str, detectionPath: str, outputPath: str, metho
         saveAsModel: identify the lights by their index ("lightId") instead of their view, to reuse the calibration
                      on other datasets acquired with the same lights in the same order.
         visualizationFolder: if set, write "<imageStem>_<method>.png" images of a sphere lit by each estimated light.
+        ellipticEstimation: use the perspective sphere model, with the pinhole intrinsics of the views. The detected
+                            circles are the minor axes of the sphere images.
     """
     spheres = loadSpheres(detectionPath)
     sfm = dataIO.loadSfmData(sfmPath)
@@ -261,7 +389,8 @@ def lightingCalibration(sfmPath: str, detectionPath: str, outputPath: str, metho
             logger.warning(f"No detected sphere found for '{imagePath}'.")
             continue
 
-        result = calibrateImage(imagePath, sphere, method, logger)
+        camera = pinholeCamera(sfm, view) if ellipticEstimation else None
+        result = calibrateImage(imagePath, sphere, method, logger, camera)
         if result is None:
             continue
         direction, intensity = result
