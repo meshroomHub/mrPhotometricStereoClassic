@@ -306,7 +306,7 @@
                 "outputs": {}
             }
         },
-        "LightingCalibration": {
+        "LightingCalibrationPy": {
             "1.0": {
                 "inputs": {
                     "inputPath": {
@@ -435,8 +435,8 @@
                 }
             }
         },
-        "SphereDetection": {
-            "2.0": {
+        "SphereDetectionPy": {
+            "1.0": {
                 "inputs": {
                     "input": {
                         "type": "File",
@@ -466,6 +466,10 @@
                     "minScore": {
                         "type": "FloatParam",
                         "value": 0.0
+                    },
+                    "useGpu": {
+                        "type": "BoolParam",
+                        "value": false
                     },
                     "verboseLevel": {
                         "type": "ChoiceParam",
@@ -520,16 +524,16 @@
                 ]
             }
         },
-        "LightingCalibration_1": {
-            "nodeType": "LightingCalibration",
+        "LightingCalibrationPy_1": {
+            "nodeType": "LightingCalibrationPy",
             "version": "1.0",
             "position": [
                 400,
                 0
             ],
             "inputs": {
-                "inputPath": "{SphereDetection_1.input}",
-                "inputDetection": "{SphereDetection_1.output}"
+                "inputPath": "{SphereDetectionPy_1.input}",
+                "inputDetection": "{SphereDetectionPy_1.output}"
             }
         },
         "PhotometricStereoHalide_1": {
@@ -540,13 +544,13 @@
                 0
             ],
             "inputs": {
-                "inputPath": "{LightingCalibration_1.inputPath}",
-                "pathToJSONLightFile": "{LightingCalibration_1.outputFile}"
+                "inputPath": "{LightingCalibrationPy_1.inputPath}",
+                "pathToJSONLightFile": "{LightingCalibrationPy_1.outputFile}"
             }
         },
-        "SphereDetection_1": {
-            "nodeType": "SphereDetection",
-            "version": "2.0",
+        "SphereDetectionPy_1": {
+            "nodeType": "SphereDetectionPy",
+            "version": "1.0",
             "position": [
                 200,
                 0

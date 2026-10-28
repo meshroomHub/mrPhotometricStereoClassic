@@ -95,23 +95,28 @@ def test_sphereShapeKeyableValues(nodeDescs, dataset, tmp_path):
 
 
 def test_template(nodeDescs):
-    nodeDesc = nodeDescs["PhotometricStereoHalide"]
     with open(TEMPLATE_FILE) as f:
         template = json.load(f)
     graph = template["graph"]
-    node = graph["PhotometricStereoHalide_1"]
-    assert node["nodeType"] == "PhotometricStereoHalide"
-    assert node["version"] == "1.0"
+    nodeNames = {node["nodeType"]: name for name, node in graph.items()}
+    # The upstream C++ nodes are replaced by the Python ones
+    assert not {"PhotometricStereo", "SphereDetection", "LightingCalibration"} & set(nodeNames)
 
-    # Every attribute referenced in the template exists on the node
-    attributes = {a.name for a in nodeDesc.inputs + nodeDesc.outputs}
-    assert set(node["inputs"]) <= attributes
-    references = re.findall(r"\{PhotometricStereoHalide_1\.(\w+)\}", json.dumps(graph))
-    assert references and set(references) <= attributes
+    for nodeType, nodeDesc in nodeDescs.items():
+        nodeName = nodeNames[nodeType]
+        node = graph[nodeName]
+        assert node["version"] == "1.0"
 
-    # The template node description is the current one
-    templateInputs = template["nodeDescriptions"]["PhotometricStereoHalide"]["1.0"]["inputs"]
-    assert set(templateInputs) == {a.name for a in nodeDesc.inputs}
+        # Every attribute referenced in the template exists on the node
+        attributes = {a.name for a in nodeDesc.inputs + nodeDesc.outputs}
+        assert set(node["inputs"]) <= attributes
+        references = re.findall(r"\{" + nodeName + r"\.(\w+)\}", json.dumps(graph))
+        assert references and set(references) <= attributes
+
+        # The template node description is the current one
+        templateInputs = template["nodeDescriptions"][nodeType]["1.0"]["inputs"]
+        assert set(templateInputs) == {a.name for a in nodeDesc.inputs}
+
 
 def test_lightingCalibrationDescriptor(nodeDescs):
     nodeDesc = nodeDescs["LightingCalibrationPy"]
