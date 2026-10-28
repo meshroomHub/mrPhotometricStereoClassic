@@ -1,0 +1,9 @@
+[project]
+name = "mrPhotometricStereo"
+version = "0.1.0"
+description = "Photometric stereo implemented in Python with Halide: normal and albedo maps from images lit by known directional lights."
+license = "MPL-2.0"
+dependencies = ["numpy", "halide", "OpenImageIO", "pyalicevision"]
+
+[tool.meshroom]
+requirements = "AliceVision Python bindings (pyalicevision), Halide Python bindings, OpenImageIO Python bindings"
