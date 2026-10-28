@@ -21,7 +21,7 @@ from photometricStereoHalide import sphereDetection  # noqa: E402
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NODES_FOLDER = os.path.join(REPO, "meshroom", "photometricStereo")
 TEMPLATE_FILE = os.path.join(REPO, "meshroom", "photometricStereoHalide.mgt")
-NODE_TYPES = ["PhotometricStereoHalide", "SphereDetectionPy"]
+NODE_TYPES = ["PhotometricStereoHalide", "SphereDetectionPy", "LightingCalibrationPy"]
 
 
 @pytest.fixture(scope="module")
@@ -112,3 +112,11 @@ def test_template(nodeDescs):
     # The template node description is the current one
     templateInputs = template["nodeDescriptions"]["PhotometricStereoHalide"]["1.0"]["inputs"]
     assert set(templateInputs) == {a.name for a in nodeDesc.inputs}
+
+def test_lightingCalibrationDescriptor(nodeDescs):
+    nodeDesc = nodeDescs["LightingCalibrationPy"]
+    assert issubclass(nodeDesc, desc.Node)
+    assert {a.name for a in nodeDesc.inputs} >= {"inputPath", "inputDetection", "saveAsModel", "method"}
+    assert {a.name for a in nodeDesc.outputs} == {"outputFile", "lightingEstimationVisualization"}
+    method = next(a for a in nodeDesc.inputs if a.name == "method")
+    assert method.values == ["brightestPoint", "whiteSphere", "SH"]

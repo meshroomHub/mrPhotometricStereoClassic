@@ -6,6 +6,8 @@ outputs, so they are drop-in replacements in the photometric stereo pipeline
 
 - **SphereDetectionPy**: detection of the calibration spheres, running the AliceVision detection network with
   [ONNX Runtime](https://onnxruntime.ai), or manually defined spheres.
+- **LightingCalibrationPy**: light directions and intensities from the calibration spheres (numpy), reading only the
+  area of the spheres from the images.
 - **PhotometricStereoHalide**: normal and albedo maps, with the per-pixel computations in [Halide](https://halide-lang.org).
 
 ## Layout
@@ -15,11 +17,13 @@ repo/
 ├── meshroom/
 │   ├── photometricStereo/PhotometricStereoHalide.py   # Meshroom nodes
 │   ├── photometricStereo/SphereDetectionPy.py
+│   ├── photometricStereo/LightingCalibrationPy.py
 │   └── photometricStereoHalide.mgt                    # Pipeline template using the Halide node
 ├── photometricStereoHalide/                           # Implementation (importable from the plugin root)
 │   ├── halidePipelines.py                             # Halide pipelines (per-pixel computations)
 │   ├── photometricStereo.py                           # Per-pose orchestration
 │   ├── sphereDetection.py                             # Calibration sphere detection (ONNX Runtime)
+│   ├── lightingCalibration.py                         # Lighting calibration from the spheres
 │   └── dataIO.py                                      # SfMData, light files, image read/write (pyalicevision)
 ├── tests/
 └── pyproject.toml
@@ -44,6 +48,26 @@ The output is the same shape file as AliceVision (`detection.json`), with JSON n
 (`libonnxruntime_providers_cuda.so: undefined symbol onnxruntime::GetEnvironmentVar`, even in an environment with only
 `pyonnxruntime`), and ONNX Runtime silently falls back to the CPU: the node logs a warning when this happens.
 On CPU, the detection takes ~0.8s per image at 320x240, like the C++ node.
+
+## LightingCalibrationPy
+
+One light per image with a sphere (ambient images excluded), written in the same JSON file as AliceVision
+(`lights.json`, lights identified by `viewId`, or by `lightId` with `saveAsModel`):
+
+- **brightestPoint** (shiny spheres): the sphere is cut out of the image and smoothed with a triangle kernel; the light
+  is the mirror reflection of the viewing direction (orthographic camera) on the normal of the brightest point.
+  Same algorithm as AliceVision. Intensity 1.
+- **whiteSphere** (white matte spheres): Lambertian least squares fit `normal . L = I` on the sphere pixels within 95%
+  of the radius whose value is between 0.2 and 0.8 (neither in shadow nor saturated). Direction `L / |L|`,
+  intensity `|L|`.
+- **SH**: the whiteSphere fit for the directional part, then the 6 other terms of the AliceVision second order
+  spherical harmonics fitted on the residual. The photometric stereo only uses the directional part.
+
+The images are read as luminance (`0.2126 R + 0.7152 G + 0.0722 B`, like AliceVision's grayscale reading), and only
+the sphere area is read through OIIO, except for RAW images. The node also writes `<imageStem>_<method>.png` images of
+a sphere lit by each estimated light, like AliceVision (images with the same file name in different folders share it).
+
+On 16 images of 2000x1500: 0.6 to 0.8s against 1.0 to 1.2s for the C++ node, half of it being image reading.
 
 ## PhotometricStereoHalide
 
@@ -79,6 +103,10 @@ rez env python-3.11 pyhalide pyoiio pyonnxruntime aliceVision-develop pytest -- 
 - `test_sphereDetection.py`: automatic detection against the ground truth spheres, and parity of the automatic, manual
   and sphere file modes with `aliceVision_sphereDetection`. The automatic detection runs once for the session
   (~15s on CPU).
+- `test_lightingCalibration.py`: partial image reading against AliceVision's, each method against the ground truth
+  lights and intensities, `saveAsModel`, skipped views, parity of `brightestPoint` (lights and visualizations) with
+  `aliceVision_lightingCalibration`, and the full chain of Python nodes (detected spheres → lighting calibration →
+  photometric stereo) against the ground truth lights and normals.
 - `test_meshroomNode.py`: node descriptors, resources, keyable `sphereShape` values and template consistency,
   skipped without Meshroom. To run it too:
   `rez env meshroom-develop pyhalide pyoiio pyonnxruntime pytest -- python -m pytest tests`.
@@ -133,3 +161,22 @@ mask + ambient removal and downscale modes. The differences come from fixes:
 - Poses with fewer than 3 images are skipped with a warning (the system is underdetermined).
 - `maskPath` can be a mask file, as stated in the node description (the C++ node only supports a folder).
 - The unused `SHOrder` parameter is not exposed: like in C++, the lighting is always reduced to directional.
+
+### LightingCalibrationPy
+
+Checked on the synthetic datasets (320x240 with detected spheres, 2000x1500 with the ground truth spheres):
+`brightestPoint` gives the same lights as the C++ node (max difference 2e-7), in the same order, and the same
+visualizations (at most 1 level of difference). Differences:
+
+- **whiteSphere**: the C++ node solves the least squares system on the full matrix, whose rows beyond the valid
+  pixels are never written: its lights are wrong (35 to 75 degrees of error) or NaN, and change between runs. Here
+  only the valid pixels are used: 1.2 degrees of error with the ground truth spheres.
+- **whiteSphere/SH**: the normals are computed from the pixel position relative to the sphere center (relative to
+  the corner of the integer patch in C++), and the SH residual removes the scaled directional part (the unit
+  direction in C++). The C++ SH directions are correct and match these ones.
+- The views sharing the same acquisition date are all calibrated (C++ keeps only one of them).
+- Views whose sphere has fewer usable pixels than unknowns are skipped with a warning.
+- `ellipticEstimation` (perspective sphere model) is not supported: the C++ implementation crashes, as the mask used
+  to fit the ellipse is never drawn.
+- Views with a sphere smaller than a pixel are skipped with a warning (C++ reads an empty patch).
+- The values are written as JSON numbers (the C++ node writes strings).

@@ -228,11 +228,16 @@ def writeImageRGB8(path: str, planar: np.ndarray):
     avimage.writeImage(path, img, _writeOptions(avimage.EStorageDataType_Float))
 
 
+def writeImageGray(path: str, pixels: np.ndarray):
+    """ Write a (H, W) float32 single channel image without color conversion. """
+    img = avimage.Image_float()
+    img.fromNumpyArray(np.ascontiguousarray(pixels[:, :, None], dtype=np.float32))
+    avimage.writeImage(path, img, _writeOptions(avimage.EStorageDataType_Float))
+
+
 def writeMask(path: str, mask: np.ndarray):
     """ Write a (H, W) float32 mask. """
-    img = avimage.Image_float()
-    img.fromNumpyArray(np.ascontiguousarray(mask[:, :, None], dtype=np.float32))
-    avimage.writeImage(path, img, _writeOptions(avimage.EStorageDataType_Float))
+    writeImageGray(path, mask)
 
 
 def writeOutputSfmData(sfmPath: str, outputFolder: str):

@@ -3,6 +3,7 @@ Shared fixtures: a synthetic photometric stereo dataset with known normals (see 
 and helpers to run the Halide implementation and the AliceVision C++ one on it.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -83,3 +84,19 @@ def angularError(normals, groundTruth):
     cosine = np.clip(np.sum(normals.astype(np.float64) * groundTruth, axis=2), -1, 1)
     return np.degrees(np.arccos(cosine))
 
+
+def readLights(path):
+    """ Read a lights JSON file as {viewId (int): light}. """
+    with open(path) as f:
+        return {int(light["viewId"]): light for light in json.load(f)["lights"]}
+
+
+def lightErrors(estimatedPath, groundTruthPath):
+    """ Angles, in degrees, between the estimated and ground truth light directions, per view id. """
+    groundTruth = readLights(groundTruthPath)
+    errors = {}
+    for viewId, light in readLights(estimatedPath).items():
+        direction = np.array(light["direction"][:3], dtype=float)
+        cosine = direction @ np.array(groundTruth[viewId]["direction"], dtype=float) / np.linalg.norm(direction)
+        errors[viewId] = np.degrees(np.arccos(np.clip(cosine, -1, 1)))
+    return errors
