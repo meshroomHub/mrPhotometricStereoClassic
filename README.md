@@ -28,6 +28,7 @@ repo/
 │   ├── lightingCalibration.py                         # Lighting calibration from the spheres
 │   └── dataIO.py                                      # SfMData, light files, image read/write (pyalicevision)
 ├── tests/
+├── ci/runTests.sh                                     # Test script run by the GitHub workflow (.github/)
 └── pyproject.toml
 ```
 
@@ -135,6 +136,21 @@ rez env python-3.11 pyhalide pyoiio pyonnxruntime aliceVision-develop pytest -- 
   `rez env meshroom-develop pyhalide pyoiio pyonnxruntime pytest -- python -m pytest tests`.
 
 The tests comparing with AliceVision are skipped if the binaries are not available.
+
+### Continuous integration
+
+The GitHub workflow (`.github/workflows/continuous-integration.yml`) runs flake8 (syntax errors and undefined names
+only), and the whole test suite in the AliceVision Docker image (`alicevision/alicevision`), which provides the
+AliceVision command line tools and the `pyalicevision` and OpenImageIO Python bindings. `ci/runTests.sh` installs
+Halide, ONNX Runtime and pytest in a virtual environment and uses a Meshroom checkout for the node tests. To run it
+locally:
+
+```
+docker run --rm -v "$PWD:/workspace" -w /workspace alicevision/alicevision:2026.10.23-rocky9-cuda12.8.0 bash ci/runTests.sh
+```
+
+The sphere detection model is not public: the tests needing it are skipped, unless the repository variable
+`SPHERE_DETECTION_MODEL_URL` gives a URL to download it from.
 
 ### Synthetic dataset
 
