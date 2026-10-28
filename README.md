@@ -30,8 +30,11 @@ For each pose (group of views sharing the same pose id, i.e. images in the same 
   accumulated one image at a time (`AccumulatePipeline`): memory does not depend on the number of lights.
   Normals are the normalized luminance solution, albedo the norm of each color channel's solution.
 - **Robust** (`isRobust`): L1 fitting of the luminance with ADMM, each iteration being two Halide pipelines
-  (`RobustSolvePipeline`, `RobustUpdatePipeline`) with the global convergence test in numpy. The albedo is the median,
-  over the lit images, of the image/shading ratios. All the images of a pose are kept in memory.
+  (`RobustSolvePipeline`, `RobustUpdatePipeline`). The penalty grows by 10% per iteration, and the iterations stop when
+  the relative primal residual `|L.M - I - E| / |I|` is below 1e-5 (checked in numpy every 10 iterations): ~110
+  iterations on the synthetic dataset, where it halves the normal error on the pixels in shadow for some lights
+  (5.2 to 3.0 degrees) without changing the others. The albedo is the median, over the lit images, of the
+  image/shading ratios. All the images of a pose are kept in memory.
 - Post-processing in Halide: camera to world rotation of the normals and false-color PNG encoding.
 
 The pipelines are JIT-compiled once per process (~1s), then vectorized (AVX2) and multi-threaded.
@@ -49,8 +52,8 @@ rez env python-3.11 pyhalide pyoiio aliceVision-develop pytest -- python -m pyte
   the vectorization tails of the in-place updates).
 - `test_dataIO.py`: light file formats (JSON per view or as a model, SH, `.lp`, folder) and grouping of the views by pose.
 - `test_photometricStereo.py`: end-to-end on a synthetic dataset (2 poses × 8 lights + ambient, generated with
-  `aliceVision_cameraInit`): accuracy against the ground truth normals, outputs, masks, world normals, errors, and
-  parity with `aliceVision_photometricStereo` (skipped if the binaries are not available).
+  `aliceVision_cameraInit`): accuracy against the ground truth normals, outputs, masks, world normals, robustness to
+  shadows, errors, and parity with `aliceVision_photometricStereo` (skipped if the binaries are not available).
 - `test_meshroomNode.py`: node descriptor and template consistency, skipped without Meshroom. To run it too:
   `rez env meshroom-develop pyhalide pyoiio pytest -- python -m pytest tests`.
 
@@ -75,9 +78,12 @@ in default, mask + ambient removal and downscale modes. The differences come fro
 
 - **World normals**: the C++ `applyRotation` rotates in place, reusing already rotated components, which produces
   non-unit, wrongly oriented world normals. Here the rotation is applied correctly.
-- **Robust mode**: the C++ code starts ADMM from an uninitialized matrix (a few pixels end up with wrong normals) and
-  computes the albedo median over all images, including unlit ones (division by negative or null shading). Here ADMM
-  starts from 0 and the median only uses lit images, so the robust albedo differs.
+- **Robust mode**: the C++ estimation stops after 11 iterations, as its convergence test (relative change of the
+  solution) is met while ADMM has not moved away from the least squares solution yet: its result is the least squares
+  one. Besides, it starts from an uninitialized matrix: depending on the run, some pixels end up with wrong normals.
+  Here ADMM starts from 0, uses an increasing penalty and stops on the primal residual (see above). The C++ albedo
+  median also uses all the images, including unlit ones (division by negative or null shading); here only the lit
+  ones are used.
 - **Ambient image**: in C++, the ambient image of a pose is reused by the next poses without one. Here it is per pose.
 - **Mask output**: `<POSE_ID>_mask.png` is the full-resolution mask of the processed pixels (C++ writes a 1x1 image
   when no mask is given).

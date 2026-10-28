@@ -89,7 +89,9 @@ def test_downscale(dataset, runHalide):
 def test_missingImage(dataset, runHalide, tmp_path):
     with open(dataset.sfmPath) as f:
         sfm = json.load(f)
-    sfm["views"][0]["path"] = str(tmp_path / "missing.exr")
+    # A lit image: the ambient image is not read without "removeAmbient"
+    view = next(v for v in sfm["views"] if "ambient" not in os.path.basename(v["path"]))
+    view["path"] = str(tmp_path / "missing.exr")
     sfmPath = tmp_path / "missing.sfm"
     sfmPath.write_text(json.dumps(sfm))
     with pytest.raises(FileNotFoundError):
@@ -131,11 +133,20 @@ def test_parityWithAliceVision(dataset, runHalide, runAliceVision, params):
         assert sfmViews(halideOutput / sfmName) == sfmViews(aliceVisionOutput / sfmName)
 
 
-def test_robustParityWithAliceVision(dataset, runHalide, runAliceVision):
-    """ The robust normals match the C++ ones, except on a few pixels where the C++ initialization is wrong. """
-    halideOutput = runHalide(isRobust=True)
-    aliceVisionOutput = runAliceVision(isRobust=True)
-    for poseId in dataset.poseIds.values():
-        difference = np.abs(readImage(halideOutput / f"{poseId}_normals.exr") -
-                            readImage(aliceVisionOutput / f"{poseId}_normals.exr")).max(axis=2)
-        assert np.mean(difference > 1e-3) < 1e-3
+def test_robustShadows(dataset, runHalide):
+    """
+    The robust estimation is less sensitive to the shadows than the least squares: better normals on the pixels in
+    shadow for some lights, same normals elsewhere.
+    (Not compared with AliceVision: its robust estimation stops after 11 iterations, on its least squares solution or,
+    depending on the run, on a wrong solution as it starts from an uninitialized matrix.)
+    """
+    leastSquaresOutput = runHalide(name="leastSquares")
+    robustOutput = runHalide(name="robust", isRobust=True)
+    for name, poseId in dataset.poseIds.items():
+        groundTruth = dataset.groundTruth[name]
+        inShadow = np.any(groundTruth @ dataset.directions.T <= 0, axis=2)
+        assert 0.02 < np.mean(inShadow) < 0.5
+        leastSquaresError = angularError(readImage(leastSquaresOutput / f"{poseId}_normals.exr"), groundTruth)
+        robustError = angularError(readImage(robustOutput / f"{poseId}_normals.exr"), groundTruth)
+        assert np.median(robustError[inShadow]) < 0.75 * np.median(leastSquaresError[inShadow])
+        assert np.median(robustError[~inShadow]) == pytest.approx(np.median(leastSquaresError[~inShadow]), abs=0.1)

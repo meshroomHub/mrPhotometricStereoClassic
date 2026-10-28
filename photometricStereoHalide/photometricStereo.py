@@ -22,10 +22,15 @@ class PhotometricStereoParameters:
     removeAmbient: bool = False
     isRobust: bool = False
     downscale: int = 1
-    # Robust (ADMM) algorithm parameters
+    # Robust (ADMM) algorithm parameters: the penalty mu grows by "muGrowth" per iteration up to "muMax", and the
+    # iterations stop when the relative primal residual |L.M - I - E| / |I| is below "epsilon"
     mu: float = 0.1
+    muGrowth: float = 1.1
+    muMax: float = 1e4
     maxIterations: int = 1000
-    epsilon: float = 0.001
+    epsilon: float = 1e-5
+    # The primal residual is a full pass on the images: it is only computed every "convergenceCheckStep" iterations
+    convergenceCheckStep: int = 10
 
 
 def solveLeastSquares(imagePaths, lightMat, intensities, ambient, mask, params, logger):
@@ -55,8 +60,8 @@ def solveLeastSquares(imagePaths, lightMat, intensities, ambient, mask, params, 
 
 def solveRobust(imagePaths, lightMat, intensities, ambient, mask, params, logger):
     """
-    Robust photometric stereo: L1 fitting of the luminance (sparse errors E, Lagrange multipliers W)
-    with ADMM, then albedo as the per-channel median of the image / shading ratios.
+    Robust photometric stereo: L1 fitting of the luminance (sparse errors E, Lagrange multipliers W) with ADMM and an
+    increasing penalty, then albedo as the per-channel median of the image / shading ratios.
     All the images are kept in memory.
 
     Returns:
@@ -83,22 +88,25 @@ def solveRobust(imagePaths, lightMat, intensities, ambient, mask, params, logger
 
     # Initialization with M = 0
     solution = np.zeros((3, height, width), dtype=np.float32)
-    previousSolution = np.zeros_like(solution)
     errors = np.ascontiguousarray(-gray)
     multipliers = np.zeros_like(gray)
+    grayNorm = max(float(np.linalg.norm(gray)), 1e-30)
 
     robustSolve = hp.getPipeline(hp.RobustSolvePipeline)
     robustUpdate = hp.getPipeline(hp.RobustUpdatePipeline)
-    for k in range(params.maxIterations):
-        previousSolution, solution = solution, previousSolution
-        robustSolve(gray, errors, multipliers, pinv, params.mu, solution)
-        robustUpdate(gray, multipliers, solution, lights, params.mu, errors)
+    mu = params.mu
+    for k in range(1, params.maxIterations + 1):
+        robustSolve(gray, errors, multipliers, pinv, mu, solution)
+        robustUpdate(gray, multipliers, solution, lights, mu, errors)
 
-        solutionNorm = np.linalg.norm(solution)
-        relativeDev = np.linalg.norm(previousSolution - solution) / solutionNorm if solutionNorm > 0 else 0.0
-        if k > 10 and relativeDev < params.epsilon:
-            logger.info(f"  Robust estimation converged in {k} iterations.")
-            break
+        # Do not use the change of the solution: it is close to 0 during the first iterations, before ADMM moves
+        # away from the least squares solution (this stopped the AliceVision implementation after 11 iterations)
+        if k % params.convergenceCheckStep == 0:
+            primalResidual = np.linalg.norm(np.einsum("nj,jhw->nhw", lights, solution) - gray - errors) / grayNorm
+            if primalResidual < params.epsilon:
+                logger.info(f"  Robust estimation converged in {k} iterations.")
+                break
+        mu = min(mu * params.muGrowth, params.muMax)
     else:
         logger.warning(f"  Robust estimation did not converge in {params.maxIterations} iterations.")
 
