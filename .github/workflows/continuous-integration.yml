@@ -1,0 +1,78 @@
+name: Continuous Integration
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+env:
+  # AliceVision image providing the command line tools and the Python bindings (see ci/runTests.sh)
+  ALICEVISION_IMAGE: alicevision/alicevision:2026.10.23-rocky9-cuda12.8.0
+  MESHROOM_REF: develop
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Lint with flake8
+        run: |
+          pip install flake8
+          # Stop the build on syntax errors and undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Report the other errors as warnings
+          flake8 . --count --exit-zero --max-line-length=127 --statistics
+
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      # The AliceVision image takes about 15GB once extracted
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune --all --force
+          df -h /
+
+      - name: Checkout Meshroom
+        uses: actions/checkout@v6
+        with:
+          repository: alicevision/Meshroom
+          ref: ${{ env.MESHROOM_REF }}
+          path: meshroom-src
+
+      - name: Pull the AliceVision image
+        run: docker pull --quiet "$ALICEVISION_IMAGE"
+
+      # The sphere detection model is not public: the detection tests are skipped unless the repository variable
+      # SPHERE_DETECTION_MODEL_URL gives a URL to download it from
+      - name: Download the sphere detection model
+        if: vars.SPHERE_DETECTION_MODEL_URL != ''
+        env:
+          MODEL_URL: ${{ vars.SPHERE_DETECTION_MODEL_URL }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/model"
+          curl --fail --silent --show-error --location "$MODEL_URL" -o "$RUNNER_TEMP/model/sphereDetection_Mask-RCNN.onnx"
+          echo "MODEL_ARGS=-v $RUNNER_TEMP/model:/model:ro -e ALICEVISION_SPHERE_DETECTION_MODEL=/model/sphereDetection_Mask-RCNN.onnx" >> "$GITHUB_ENV"
+
+      - name: Run the tests
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace -e MESHROOM_ROOT=/workspace/meshroom-src ${MODEL_ARGS:-} \
+            "$ALICEVISION_IMAGE" bash ci/runTests.sh
